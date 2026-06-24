@@ -73,6 +73,17 @@ interface ToolConfig {
 	getAssetName: (version: string, plat: string, architecture: string) => string | null;
 }
 
+// ffmpeg static-binary asset names (eugeneware/ffmpeg-static direct binaries).
+// Maps node arch (arm64|x64) only; everything else is unsupported.
+export function ffmpegAssetName(_version: string, plat: string, architecture: string): string | null {
+	if (architecture !== "arm64" && architecture !== "x64") return null;
+	if (plat === "darwin") return `ffmpeg-darwin-${architecture}`;
+	if (plat === "linux") return `ffmpeg-linux-${architecture}`;
+	// ffmpeg-static has no win32-arm64 build; Windows-on-ARM runs the x64 binary
+	// under emulation, so fall back to it rather than reporting no ffmpeg.
+	if (plat === "win32") return "ffmpeg-win32-x64";
+	return null;
+}
 const TOOLS: Record<string, ToolConfig> = {
 	sd: {
 		name: "sd",

@@ -127,6 +127,110 @@ jobs:
                 echo "release-tag=$release_tag"
               } >> "$GITHUB_OUTPUT"
 
+   # Compute a stable hash of every input that affects the native cdylib output,
+   # then look for any prior successful main run that already uploaded the
+   # native artifacts for this hash. Two independent outputs:
+   #   * `linux-x64-run-id` — set when the linux x64 canary
+   #     (`pi-natives-linux-x64-modern-h<hash>`) is present on a prior main run,
+   #     so native-dependent TS test jobs and `native_linux_x64` can reuse it.
+   #   * `cross-platform-run-id` — set when ALL cross-platform native artifacts
+   #     also have non-expired artifacts on that same prior run, so
+   #     `native_cross_platform` can skip the cold rebuild on main pushes after
+   #     dep changes have already warmed sccache there.
+   # Non-release native jobs are skipped when their canary hits; the canary
+   # retention window (see build-native action) is the effective TTL.
+   native_artifact_lookup:
+      name: Look up cached native artifacts
+      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      outputs:
+         source-hash: ${{ steps.compute.outputs.source-hash }}
+         linux-x64-run-id: ${{ steps.find.outputs.linux-x64-run-id }}
+         cross-platform-run-id: ${{ steps.find.outputs.cross-platform-run-id }}
+      steps:
+         - uses: actions/checkout@v4
+         - name: Compute native source hash
+           id: compute
+           shell: bash
+           run: |
+              source_hash=$(find crates Cargo.toml Cargo.lock rust-toolchain.toml \
+                      packages/natives/scripts packages/natives/package.json \
+                      scripts/ci-build-native.ts scripts/host-detect.ts \
+                      -type f -print0 \
+                    | sort -z \
+                    | xargs -0 sha256sum \
+                    | sha256sum \
+                    | cut -c1-16)
+              echo "source-hash=$source_hash" >> "$GITHUB_OUTPUT"
+              echo "Native source hash: $source_hash"
+         - name: Find prior main build with matching native artifacts
+           id: find
+           env:
+              GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+           shell: bash
+           run: |
+              hash="${{ steps.compute.outputs.source-hash }}"
+              # Canary for native_linux_x64: presence of the modern artifact
+              # implies the baseline sibling is also there (they upload from the
+              # same job).
+              linux_canary="pi-natives-linux-x64-modern-h${hash}"
+              # Required set for cross-platform reuse — names must match the
+              # `actions/upload-artifact` `name:` template in build-native action.
+              cross_platform_required=(
+                "pi-natives-linux-arm64-h${hash}"
+                "pi-natives-darwin-x64-baseline-h${hash}"
+                "pi-natives-darwin-arm64-h${hash}"
+                "pi-natives-win32-x64-baseline-h${hash}"
+                "pi-natives-win32-arm64-h${hash}"
+              )
+              linux_x64_run_id=""
+              cross_platform_run_id=""
+              for candidate in $(gh run list \
+                  --workflow=ci.yml --branch=main --status=success --event=push \
+                  --limit=20 --json databaseId --jq='.[].databaseId'); do
+                names=$(gh api "/repos/${{ github.repository }}/actions/runs/$candidate/artifacts?per_page=100" \
+                    --jq '.artifacts[] | select(.expired == false) | .name')
+                if [ -z "$linux_x64_run_id" ] && echo "$names" | grep -qFx "$linux_canary"; then
+                  linux_x64_run_id="$candidate"
+                fi
+                if [ -z "$cross_platform_run_id" ]; then
+                  all_found=true
+                  # Cross-platform reuse requires the linux canary AND every
+                  # cross-platform artifact, since release_binary downloads them
+                  # from the same run.
+                  if ! echo "$names" | grep -qFx "$linux_canary"; then
+                    all_found=false
+                  else
+                    for req in "${cross_platform_required[@]}"; do
+                      if ! echo "$names" | grep -qFx "$req"; then
+                        all_found=false
+                        break
+                      fi
+                    done
+                  fi
+                  if $all_found; then
+                    cross_platform_run_id="$candidate"
+                  fi
+                fi
+                if [ -n "$linux_x64_run_id" ] && [ -n "$cross_platform_run_id" ]; then
+                  break
+                fi
+              done
+              if [ -n "$linux_x64_run_id" ]; then
+                echo "Reusing Linux x64 native artifacts from run $linux_x64_run_id"
+              else
+                echo "No cached Linux x64 native artifacts for hash $hash; native_linux_x64 will rebuild."
+              fi
+              if [ -n "$cross_platform_run_id" ]; then
+                echo "Reusing cross-platform native artifacts from run $cross_platform_run_id"
+              else
+                echo "No cached cross-platform native artifacts for hash $hash; native_cross_platform will rebuild on main."
+              fi
+              {
+                echo "linux-x64-run-id=$linux_x64_run_id"
+                echo "cross-platform-run-id=$cross_platform_run_id"
+              } >> "$GITHUB_OUTPUT"
+
+   # Fast lint, type check, and browser bundle build (no Rust, no native build needed)
    check:
       name: Lint, type check & web build
       runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
@@ -245,6 +349,32 @@ jobs:
                  | grep -qE '^(crates/|bazel/|Cargo\.(toml|lock)|MODULE\.bazel(\.lock)?|BUILD\.bazel|\.bazelrc|\.bazelignore|\.bazelversion|rust-toolchain\.toml|rustfmt\.toml)'; then
                 echo "::notice title=Native sources changed::PR CI tests against the latest release addons by design; native changes are validated post-merge on main and at release."
               fi
+   # Pre-warm the cross-platform native build cache on `main`, in addition to
+   # building the artifacts that ship in releases. Skipped on main when
+   # native_artifact_lookup already found a recent run with all artifacts intact.
+   native_cross_platform_kata:
+      name: "Native: ${{ matrix.platform }} ${{ matrix.arch }}"
+      needs: [release_metadata, native_artifact_lookup]
+      if: ${{ needs.release_metadata.outputs.is-release == 'true' || (github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.native_artifact_lookup.outputs.cross-platform-run-id == '') }}
+      strategy:
+         fail-fast: false
+         matrix:
+            include:
+               - { os: omp-kata, platform: linux, arch: arm64, target: aarch64-unknown-linux-gnu }
+               - { os: omp-kata, platform: win32, arch: x64, target: x86_64-pc-windows-msvc, variant: baseline }
+               - { os: omp-kata, platform: win32, arch: arm64, target: aarch64-pc-windows-msvc }
+      runs-on: ${{ matrix.os }}
+      steps:
+         - uses: actions/checkout@v4
+         - uses: ./.github/actions/build-native
+           with:
+              hash: ${{ needs.native_artifact_lookup.outputs.source-hash }}
+              platform: ${{ matrix.platform }}
+              arch: ${{ matrix.arch }}
+              variant: ${{ matrix.variant }}
+              target: ${{ matrix.target }}
+              glibc: ${{ matrix.platform == 'linux' && env.GLIBC_FLOOR || '' }}
+              save_cache: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
          # ---- main path: bazel build of all Linux-hosted targets ----
          - id: cache
@@ -597,6 +727,13 @@ jobs:
                     target_id: darwin-arm64,
                     binary_path: packages/coding-agent/binaries/omp-darwin-arm64,
                     native_targets: darwin-arm64,
+                 }
+               - {
+                    os: ubuntu-22.04,
+                    platform: win32,
+                    arch: arm64,
+                    target_id: win32-arm64,
+                    binary_path: packages/coding-agent/binaries/omp-windows-arm64.exe,
                  }
       runs-on: ${{ matrix.os }}
       permissions:
